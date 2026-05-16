@@ -1,19 +1,28 @@
 from typing import Any
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 import copy
-import json
+import logging
 import os
 import sqlite3
 import time
 from urllib.parse import urlencode
-from urllib.request import urlopen, Request as UrlRequest
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 
-app = FastAPI(title="Atmos Weather API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_database()
+    yield
+
+
+app = FastAPI(title="Atmos Weather API", version="1.0.0", lifespan=lifespan)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("atmos.weather")
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -41,13 +50,9 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_database()
-
-
 @app.middleware("http")
 async def protect_api(request: Request, call_next):
+    started_at = time.perf_counter()
     if (
         request.method != "OPTIONS"
         and request.url.path.startswith("/api/")
@@ -58,7 +63,13 @@ async def protect_api(request: Request, call_next):
             enforce_api_token(request)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled error for %s %s", request.method, request.url.path)
+        raise
+    duration_ms = (time.perf_counter() - started_at) * 1000
+    logger.info("%s %s completed %s in %.1fms", request.method, request.url.path, response.status_code, duration_ms)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     return response
@@ -93,20 +104,21 @@ def cache_key(base_url: str, params: dict[str, Any]) -> str:
     return f"{base_url}?{urlencode(sorted(params.items()))}"
 
 
-def fetch_json(base_url: str, params: dict[str, Any], timeout: int = 15) -> Any:
+async def fetch_json(base_url: str, params: dict[str, Any], timeout: int = 15) -> Any:
     key = cache_key(base_url, params)
     cached = response_cache.get(key)
     if cached and cached[0] > time.time():
         return copy.deepcopy(cached[1])
 
-    request = UrlRequest(key, headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"})
-
     try:
-        with urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            response_cache[key] = (time.time() + CACHE_TTL_SECONDS, data)
-            return copy.deepcopy(data)
-    except Exception as exc:
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"}) as client:
+            response = await client.get(base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+        response_cache[key] = (time.time() + CACHE_TTL_SECONDS, data)
+        return copy.deepcopy(data)
+    except httpx.HTTPError as exc:
+        logger.warning("Weather provider request failed for %s: %s", base_url, exc)
         raise HTTPException(status_code=502, detail="Weather service is unavailable") from exc
 
 
@@ -194,9 +206,9 @@ def recent_place_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def apply_observed_current(forecast: dict[str, Any], latitude: float, longitude: float) -> dict[str, Any]:
+async def apply_observed_current(forecast: dict[str, Any], latitude: float, longitude: float) -> dict[str, Any]:
     try:
-        observed = fetch_json(
+        observed = await fetch_json(
             f"https://wttr.in/{latitude},{longitude}",
             {
                 "format": "j1",
@@ -225,9 +237,9 @@ def apply_observed_current(forecast: dict[str, Any], latitude: float, longitude:
     return forecast
 
 
-def apply_air_quality(forecast: dict[str, Any], latitude: float, longitude: float, timezone: str) -> dict[str, Any]:
+async def apply_air_quality(forecast: dict[str, Any], latitude: float, longitude: float, timezone: str) -> dict[str, Any]:
     try:
-        air = fetch_json(
+        air = await fetch_json(
             "https://air-quality-api.open-meteo.com/v1/air-quality",
             {
                 "latitude": latitude,
@@ -325,8 +337,8 @@ def unique_places(places: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
-def search_open_meteo_places(query: str) -> list[dict[str, Any]]:
-    data = fetch_json(
+async def search_open_meteo_places(query: str) -> list[dict[str, Any]]:
+    data = await fetch_json(
         "https://geocoding-api.open-meteo.com/v1/search",
         {
             "name": query,
@@ -338,8 +350,8 @@ def search_open_meteo_places(query: str) -> list[dict[str, Any]]:
     return [normalize_open_meteo_place(place) for place in data.get("results", [])]
 
 
-def search_osm_places(query: str) -> list[dict[str, Any]]:
-    data = fetch_json(
+async def search_osm_places(query: str) -> list[dict[str, Any]]:
+    data = await fetch_json(
         "https://nominatim.openstreetmap.org/search",
         {
             "q": query,
@@ -353,7 +365,7 @@ def search_osm_places(query: str) -> list[dict[str, Any]]:
     return [normalize_osm_place(place) for place in data]
 
 
-def parent_location_fallback(query: str) -> list[dict[str, Any]]:
+async def parent_location_fallback(query: str) -> list[dict[str, Any]]:
     words = [word for word in query.replace(",", " ").split() if word.lower() not in {"in", "near", "at"}]
     if len(words) < 3:
         return []
@@ -367,7 +379,7 @@ def parent_location_fallback(query: str) -> list[dict[str, Any]]:
         parent_places: list[dict[str, Any]] = []
         for searcher in (search_osm_places, search_open_meteo_places):
             try:
-                parent_places.extend(searcher(parent_query))
+                parent_places.extend(await searcher(parent_query))
             except HTTPException:
                 pass
 
@@ -524,20 +536,20 @@ def clear_recent_searches() -> dict[str, str]:
 
 
 @app.get("/api/search")
-def search_city(q: str = Query(..., min_length=2)) -> dict[str, Any]:
+async def search_city(q: str = Query(..., min_length=2)) -> dict[str, Any]:
     results: list[dict[str, Any]] = known_locality_fallback(q)
     if results:
         return {"results": results}
 
     for searcher in (search_osm_places, search_open_meteo_places):
         try:
-            results.extend(searcher(q))
+            results.extend(await searcher(q))
         except HTTPException:
             pass
 
     results = unique_places(results)
     if not results:
-        results = parent_location_fallback(q)
+        results = await parent_location_fallback(q)
 
     if not results:
         raise HTTPException(status_code=404, detail="No city found")
@@ -546,12 +558,12 @@ def search_city(q: str = Query(..., min_length=2)) -> dict[str, Any]:
 
 
 @app.get("/api/reverse")
-def reverse_geocode(
+async def reverse_geocode(
     latitude: float = Query(..., ge=-90, le=90),
     longitude: float = Query(..., ge=-180, le=180),
 ) -> dict[str, Any]:
     try:
-        osm_data = fetch_json(
+        osm_data = await fetch_json(
             "https://nominatim.openstreetmap.org/reverse",
             {
                 "lat": latitude,
@@ -577,7 +589,7 @@ def reverse_geocode(
     except HTTPException:
         pass
 
-    data = fetch_json(
+    data = await fetch_json(
         "https://geocoding-api.open-meteo.com/v1/reverse",
         {
             "latitude": latitude,
@@ -607,12 +619,12 @@ def reverse_geocode(
 
 
 @app.get("/api/weather")
-def weather(
+async def weather(
     latitude: float = Query(..., ge=-90, le=90),
     longitude: float = Query(..., ge=-180, le=180),
     timezone: str = Query("auto"),
 ) -> dict[str, Any]:
-    forecast = fetch_json(
+    forecast = await fetch_json(
         "https://api.open-meteo.com/v1/forecast",
         {
             "latitude": latitude,
@@ -658,5 +670,5 @@ def weather(
             ),
         },
     )
-    forecast = apply_observed_current(forecast, latitude, longitude)
-    return apply_air_quality(forecast, latitude, longitude, timezone)
+    forecast = await apply_observed_current(forecast, latitude, longitude)
+    return await apply_air_quality(forecast, latitude, longitude, timezone)
