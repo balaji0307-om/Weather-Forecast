@@ -1,32 +1,197 @@
 from typing import Any
-from urllib.parse import urlencode
-from urllib.request import urlopen, Request
+from collections import defaultdict, deque
+import copy
 import json
+import os
+import sqlite3
+import time
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request as UrlRequest
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 
 app = FastAPI(title="Atmos Weather API", version="1.0.0")
 
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+WEATHER_API_TOKEN = os.getenv("WEATHER_API_TOKEN", "").strip()
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    os.path.join(os.path.dirname(__file__), "weather.db"),
+)
+
+response_cache: dict[str, tuple[float, Any]] = {}
+rate_limit_hits: dict[str, deque[float]] = defaultdict(deque)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.on_event("startup")
+def startup() -> None:
+    init_database()
+
+
+@app.middleware("http")
+async def protect_api(request: Request, call_next):
+    if (
+        request.method != "OPTIONS"
+        and request.url.path.startswith("/api/")
+        and request.url.path != "/api/health"
+    ):
+        try:
+            enforce_rate_limit(request)
+            enforce_api_token(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
+def enforce_api_token(request: Request) -> None:
+    if not WEATHER_API_TOKEN:
+        return
+
+    header_token = request.headers.get("x-api-token", "").strip()
+    auth_header = request.headers.get("authorization", "").strip()
+    bearer_token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    if WEATHER_API_TOKEN not in {header_token, bearer_token}:
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+
+def enforce_rate_limit(request: Request) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    hits = rate_limit_hits[client_ip]
+
+    while hits and now - hits[0] > RATE_LIMIT_WINDOW_SECONDS:
+        hits.popleft()
+
+    if len(hits) >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again shortly.")
+
+    hits.append(now)
+
+
+def cache_key(base_url: str, params: dict[str, Any]) -> str:
+    return f"{base_url}?{urlencode(sorted(params.items()))}"
+
+
 def fetch_json(base_url: str, params: dict[str, Any], timeout: int = 15) -> Any:
-    url = f"{base_url}?{urlencode(params)}"
-    request = Request(url, headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"})
+    key = cache_key(base_url, params)
+    cached = response_cache.get(key)
+    if cached and cached[0] > time.time():
+        return copy.deepcopy(cached[1])
+
+    request = UrlRequest(key, headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"})
 
     try:
         with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            data = json.loads(response.read().decode("utf-8"))
+            response_cache[key] = (time.time() + CACHE_TTL_SECONDS, data)
+            return copy.deepcopy(data)
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Weather service is unavailable") from exc
+
+
+def get_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_database() -> None:
+    database_dir = os.path.dirname(DATABASE_PATH)
+    if database_dir:
+        os.makedirs(database_dir, exist_ok=True)
+    with get_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_searches (
+                place_key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                admin1 TEXT,
+                admin2 TEXT,
+                country TEXT,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                timezone TEXT,
+                source TEXT,
+                display_name TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+def place_storage_key(place: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(place.get("name", "")).lower(),
+            str(place.get("admin2", "")).lower(),
+            str(place.get("admin1", "")).lower(),
+            str(place.get("country", "")).lower(),
+            f"{float(place.get('latitude')):.4f}",
+            f"{float(place.get('longitude')):.4f}",
+        ]
+    )
+
+
+def save_recent_place(place: dict[str, Any]) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO recent_searches (
+                place_key, name, admin1, admin2, country, latitude, longitude,
+                timezone, source, display_name, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(place_key) DO UPDATE SET created_at = excluded.created_at
+            """,
+            (
+                place_storage_key(place),
+                place.get("name", "Selected place"),
+                place.get("admin1", ""),
+                place.get("admin2", ""),
+                place.get("country", ""),
+                float(place.get("latitude")),
+                float(place.get("longitude")),
+                place.get("timezone", "auto"),
+                place.get("source", ""),
+                place.get("displayName", ""),
+                int(time.time()),
+            ),
+        )
+
+
+def recent_place_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "name": row["name"],
+        "admin1": row["admin1"],
+        "admin2": row["admin2"],
+        "country": row["country"],
+        "latitude": row["latitude"],
+        "longitude": row["longitude"],
+        "timezone": row["timezone"] or "auto",
+        "source": row["source"],
+        "displayName": row["display_name"],
+    }
 
 
 def apply_observed_current(forecast: dict[str, Any], latitude: float, longitude: float) -> dict[str, Any]:
@@ -327,6 +492,35 @@ def known_locality_fallback(query: str) -> list[dict[str, Any]]:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/recent")
+def recent_searches() -> dict[str, list[dict[str, Any]]]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT name, admin1, admin2, country, latitude, longitude, timezone, source, display_name
+            FROM recent_searches
+            ORDER BY created_at DESC
+            LIMIT 5
+            """
+        ).fetchall()
+    return {"results": [recent_place_from_row(row) for row in rows]}
+
+
+@app.post("/api/recent")
+def add_recent_search(place: dict[str, Any]) -> dict[str, str]:
+    if "latitude" not in place or "longitude" not in place:
+        raise HTTPException(status_code=400, detail="Latitude and longitude are required")
+    save_recent_place(place)
+    return {"status": "saved"}
+
+
+@app.delete("/api/recent")
+def clear_recent_searches() -> dict[str, str]:
+    with get_connection() as connection:
+        connection.execute("DELETE FROM recent_searches")
+    return {"status": "cleared"}
 
 
 @app.get("/api/search")

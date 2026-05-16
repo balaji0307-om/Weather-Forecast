@@ -5,6 +5,7 @@ import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 const API_CANDIDATES = [...new Set([API_BASE, "http://127.0.0.1:9016", "http://127.0.0.1:9014", "http://127.0.0.1:9012", "http://127.0.0.1:9010", "http://127.0.0.1:9000", "http://127.0.0.1:8000"])];
+const API_TOKEN = import.meta.env.VITE_API_TOKEN || "";
 
 const codeMap = {
   0: ["Clear sky", "sun", "clear"],
@@ -102,10 +103,14 @@ function minutesFromTime(value) {
 
 async function requestJson(path, options = {}) {
   let lastError = new Error("Request failed");
+  const headers = {
+    ...(API_TOKEN ? { "X-API-Token": API_TOKEN } : {}),
+    ...(options.headers || {}),
+  };
 
   for (const baseUrl of API_CANDIDATES) {
     try {
-      const response = await fetch(`${baseUrl}${path}`, options);
+      const response = await fetch(`${baseUrl}${path}`, { ...options, headers });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         lastError = new Error(data.detail || "Request failed");
@@ -257,6 +262,17 @@ function App() {
   }, []);
 
   React.useEffect(() => {
+    requestJson("/api/recent")
+      .then((data) => {
+        if (data.results?.length) {
+          setRecent(data.results);
+          localStorage.setItem("atmosRecentReact", JSON.stringify(data.results));
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  React.useEffect(() => {
     liveLocationRef.current = liveLocation;
   }, [liveLocation]);
 
@@ -307,6 +323,17 @@ function App() {
     ].slice(0, 5);
     setRecent(next);
     localStorage.setItem("atmosRecentReact", JSON.stringify(next));
+    requestJson("/api/recent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(nextPlace),
+    }).catch(() => undefined);
+  }
+
+  function clearRecent() {
+    setRecent([]);
+    localStorage.removeItem("atmosRecentReact");
+    requestJson("/api/recent", { method: "DELETE" }).catch(() => undefined);
   }
 
   function placeKey(item) {
@@ -645,7 +672,7 @@ function App() {
             <section className="forecast-panel compact">
               <div className="section-title">
                 <h2>Recent Places</h2>
-                <button className="text-button" onClick={() => { setRecent([]); localStorage.removeItem("atmosRecentReact"); }}>Clear</button>
+                <button className="text-button" onClick={clearRecent}>Clear</button>
               </div>
               <div className="recent-list">
                 {recent.length ? recent.map((item) => (
