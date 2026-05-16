@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Atmos Weather Forecast</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="weather-stage" aria-label="Current weather">
+      <div class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">A</span>
+          <div>
+            <p>Atmos</p>
+            <span>Live forecast studio</span>
+          </div>
+        </div>
+
+        <form class="search" id="searchForm">
+          <label class="sr-only" for="cityInput">Search city</label>
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="m21 21-4.35-4.35m1.35-5.15a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z"/>
+          </svg>
+          <input id="cityInput" name="city" type="search" placeholder="Search city, e.g. Tokyo" autocomplete="off">
+          <button type="submit">Find</button>
+        </form>
+      </div>
+
+      <div class="hero-grid">
+        <div class="current-panel">
+          <div class="location-line">
+            <span id="currentPlace">Loading location...</span>
+            <button class="icon-button" id="geoButton" type="button" title="Use my location" aria-label="Use my location">
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M12 2v3m0 14v3m10-10h-3M5 12H2m16.24-6.24-2.12 2.12M7.88 16.12l-2.12 2.12m12.48 0-2.12-2.12M7.88 7.88 5.76 5.76"/>
+                <circle cx="12" cy="12" r="5"/>
+              </svg>
+            </button>
+          </div>
+          <div class="temperature-row">
+            <div>
+              <span class="temperature" id="currentTemp">--</span>
+              <span class="degree">°C</span>
+            </div>
+            <div class="weather-orb" id="weatherOrb" aria-hidden="true">
+              <span id="orbIcon">--</span>
+            </div>
+          </div>
+          <h1 id="currentCondition">Finding the sky...</h1>
+          <p id="weatherNarrative">Your personalized forecast will appear here in a moment.</p>
+          <div class="quick-stats" aria-label="Weather highlights">
+            <article>
+              <span>Feels</span>
+              <strong id="feelsLike">--°</strong>
+            </article>
+            <article>
+              <span>Wind</span>
+              <strong id="windSpeed">--</strong>
+            </article>
+            <article>
+              <span>Rain</span>
+              <strong id="rainChance">--%</strong>
+            </article>
+          </div>
+        </div>
+
+        <aside class="insight-panel" aria-label="Forecast insight">
+          <div class="panel-heading">
+            <span>Today Lens</span>
+            <strong id="todayDate">--</strong>
+          </div>
+          <div class="comfort-meter">
+            <div class="meter-ring" id="comfortRing">
+              <span id="comfortScore">--</span>
+            </div>
+            <div>
+              <h2 id="comfortTitle">Comfort score</h2>
+              <p id="comfortText">Calculated from temperature, humidity, wind, and rain chance.</p>
+            </div>
+          </div>
+          <div class="sun-track">
+            <div>
+              <span>Sunrise</span>
+              <strong id="sunrise">--</strong>
+            </div>
+            <div class="sun-line" aria-hidden="true"><span id="sunDot"></span></div>
+            <div>
+              <span>Sunset</span>
+              <strong id="sunset">--</strong>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="content-grid">
+      <section class="forecast-panel">
+        <div class="section-title">
+          <h2>Next 12 Hours</h2>
+          <span id="updatedAt">Updated --</span>
+        </div>
+        <div class="hourly-strip" id="hourlyStrip" aria-label="Hourly forecast"></div>
+      </section>
+
+      <section class="forecast-panel">
+        <div class="section-title">
+          <h2>7 Day Outlook</h2>
+          <span>Highs, lows, and rain risk</span>
+        </div>
+        <div class="daily-list" id="dailyList" aria-label="Daily forecast"></div>
+      </section>
+
+      <aside class="side-column">
+        <section class="forecast-panel compact">
+          <div class="section-title">
+            <h2>Air & Motion</h2>
+          </div>
+          <div class="metric-grid">
+            <article>
+              <span>Humidity</span>
+              <strong id="humidity">--%</strong>
+            </article>
+            <article>
+              <span>Pressure</span>
+              <strong id="pressure">-- hPa</strong>
+            </article>
+            <article>
+              <span>UV Index</span>
+              <strong id="uvIndex">--</strong>
+            </article>
+            <article>
+              <span>Visibility</span>
+              <strong id="visibility">-- km</strong>
+            </article>
+          </div>
+        </section>
+
+        <section class="forecast-panel compact">
+          <div class="section-title">
+            <h2>Recent Places</h2>
+            <button class="text-button" id="clearRecent" type="button">Clear</button>
+          </div>
+          <div class="recent-list" id="recentList"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
