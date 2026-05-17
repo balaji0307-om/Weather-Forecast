@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { Crosshair, Heart, Moon, Search, Sun } from "lucide-react";
 import "./styles.css";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "https://weather-forecast-5hes.onrender.com";
 const API_CANDIDATES = [...new Set([API_BASE, "http://127.0.0.1:9016", "http://127.0.0.1:9014", "http://127.0.0.1:9012", "http://127.0.0.1:9010", "http://127.0.0.1:9000", "http://127.0.0.1:8000"])];
 const API_TOKEN = import.meta.env.VITE_API_TOKEN || "";
 
