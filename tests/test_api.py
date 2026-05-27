@@ -86,3 +86,28 @@ def test_rate_limiter_blocks_excess_requests():
 
     assert first.status_code == 200
     assert second.status_code == 429
+
+
+def test_weather_returns_before_optional_details(monkeypatch):
+    database_path = configure_test_database()
+    provider_calls = []
+
+    async def fake_fetch_json(base_url, params, timeout=15):
+        provider_calls.append(base_url)
+        return {"current": {}}
+
+    async def unexpected_enrichment(*args):
+        raise AssertionError("Optional enrichment must not block the primary weather response")
+
+    monkeypatch.setattr(main, "fetch_json", fake_fetch_json)
+    monkeypatch.setattr(main, "apply_observed_current", unexpected_enrichment)
+    monkeypatch.setattr(main, "apply_air_quality", unexpected_enrichment)
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/weather?latitude=24.79&longitude=85.00&timezone=auto")
+
+    remove_test_database(database_path)
+
+    assert response.status_code == 200
+    assert response.json()["air_quality"] is None
+    assert provider_calls == ["https://api.open-meteo.com/v1/forecast"]

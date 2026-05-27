@@ -4,7 +4,10 @@ import { Crosshair, Heart, Moon, Search, Sun } from "lucide-react";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "https://weather-forecast-5hes.onrender.com";
-const API_CANDIDATES = [...new Set([API_BASE, "http://127.0.0.1:9016", "http://127.0.0.1:9014", "http://127.0.0.1:9012", "http://127.0.0.1:9010", "http://127.0.0.1:9000", "http://127.0.0.1:8000"])];
+const LOCAL_API_CANDIDATES = import.meta.env.DEV
+  ? ["http://127.0.0.1:9016", "http://127.0.0.1:9014", "http://127.0.0.1:9012", "http://127.0.0.1:9010", "http://127.0.0.1:9000", "http://127.0.0.1:8000"]
+  : [];
+const API_CANDIDATES = [...new Set([API_BASE, ...LOCAL_API_CANDIDATES])];
 const API_TOKEN = import.meta.env.VITE_API_TOKEN || "";
 
 const codeMap = {
@@ -130,6 +133,51 @@ async function api(path) {
   return requestJson(path);
 }
 
+async function publicForecast(place) {
+  const params = new URLSearchParams({
+    latitude: place.latitude,
+    longitude: place.longitude,
+    timezone: place.timezone || "auto",
+    forecast_days: "7",
+    cell_selection: "nearest",
+    temperature_unit: "celsius",
+    wind_speed_unit: "kmh",
+    precipitation_unit: "mm",
+    current: [
+      "temperature_2m",
+      "relative_humidity_2m",
+      "apparent_temperature",
+      "precipitation",
+      "weather_code",
+      "pressure_msl",
+      "wind_speed_10m",
+      "wind_direction_10m",
+    ].join(","),
+    hourly: [
+      "temperature_2m",
+      "precipitation_probability",
+      "weather_code",
+      "visibility",
+      "uv_index",
+      "wind_speed_10m",
+      "wind_direction_10m",
+    ].join(","),
+    daily: [
+      "weather_code",
+      "temperature_2m_max",
+      "temperature_2m_min",
+      "precipitation_probability_max",
+      "sunrise",
+      "sunset",
+    ].join(","),
+  });
+  const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
+  if (!response.ok) throw new Error("Forecast service is unavailable.");
+  const data = await response.json();
+  data.air_quality = null;
+  return data;
+}
+
 function placeLabel(place) {
   const [name, ...rest] = compactPlaceParts(place.name, place.admin2, place.admin1, place.country);
   return `${name || "Selected place"}${rest.length ? ` · ${rest.join(", ")}` : ""}`;
@@ -166,6 +214,14 @@ function distanceKm(from, to) {
     Math.sin(deltaLat / 2) ** 2 +
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLon / 2) ** 2;
   return Math.round(earthRadius * 2 * Math.atan2(Math.sqrt(angle), Math.sqrt(1 - angle)));
+}
+
+function storedJson(key, fallback) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || "null") || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function rankSuggestions(results, reference) {
@@ -229,8 +285,8 @@ function activityTip(view) {
 
 function App() {
   const [query, setQuery] = React.useState("");
-  const [place, setPlace] = React.useState(locatingPlace);
-  const [forecast, setForecast] = React.useState(null);
+  const [place, setPlace] = React.useState(() => storedJson("atmosLastPlace", locatingPlace));
+  const [forecast, setForecast] = React.useState(() => storedJson("atmosLastForecast", null));
   const [recent, setRecent] = React.useState(() => JSON.parse(localStorage.getItem("atmosRecentReact") || "[]"));
   const [favorites, setFavorites] = React.useState(() => JSON.parse(localStorage.getItem("atmosFavorites") || "[]"));
   const [suggestions, setSuggestions] = React.useState([]);
@@ -245,6 +301,7 @@ function App() {
   const [message, setMessage] = React.useState("");
   const liveLocationRef = React.useRef(true);
   const watchIdRef = React.useRef(null);
+  const liveWeatherCoordsRef = React.useRef(null);
 
   React.useEffect(() => {
     const weatherClass = forecast ? codeInfo(forecast.current.weather_code)[2] : "clear";
@@ -354,14 +411,36 @@ function App() {
   }
 
   async function loadWeather(nextPlace, shouldRemember = true) {
+    const timezone = encodeURIComponent(nextPlace.timezone || "auto");
+    const locationParams = `latitude=${nextPlace.latitude}&longitude=${nextPlace.longitude}&timezone=${timezone}`;
     try {
       setLoading(true);
-      const timezone = encodeURIComponent(nextPlace.timezone || "auto");
-      const data = await api(`/api/weather?latitude=${nextPlace.latitude}&longitude=${nextPlace.longitude}&timezone=${timezone}`);
+      let data;
+      try {
+        data = await publicForecast(nextPlace);
+      } catch {
+        data = await api(`/api/weather?${locationParams}`);
+      }
       setPlace(nextPlace);
       setForecast(data);
       setReferenceCoords(nextPlace);
+      localStorage.setItem("atmosLastPlace", JSON.stringify(nextPlace));
+      localStorage.setItem("atmosLastForecast", JSON.stringify(data));
       if (shouldRemember) remember(nextPlace);
+      api(`/api/weather/details?${locationParams}`)
+        .then((details) => {
+          setForecast((current) => {
+            if (current !== data) return current;
+            const enriched = {
+              ...current,
+              current: { ...current.current, ...(details.current || {}) },
+              air_quality: details.air_quality,
+            };
+            localStorage.setItem("atmosLastForecast", JSON.stringify(enriched));
+            return enriched;
+          });
+        })
+        .catch(() => undefined);
     } catch (error) {
       flash(error.message || "Could not load weather.");
     } finally {
@@ -432,6 +511,7 @@ function App() {
 
     setLiveLocation(true);
     liveLocationRef.current = true;
+    liveWeatherCoordsRef.current = null;
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
     }
@@ -445,29 +525,32 @@ function App() {
         setReferenceCoords(currentCoords);
         if (!liveLocationRef.current) return;
 
+        const previousCoords = liveWeatherCoordsRef.current;
+        if (previousCoords && distanceKm(previousCoords, currentCoords) < 1) return;
+        liveWeatherCoordsRef.current = currentCoords;
+        const currentPlace = {
+          name: "Your current location",
+          country: "",
+          latitude: currentCoords.latitude,
+          longitude: currentCoords.longitude,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          liveLocation: true,
+        };
+        loadWeather(currentPlace, false);
+
         try {
           const data = await api(`/api/reverse?latitude=${currentCoords.latitude}&longitude=${currentCoords.longitude}`);
-          await loadWeather(
-            {
-              ...data.place,
-              latitude: currentCoords.latitude,
-              longitude: currentCoords.longitude,
-              liveLocation: true,
-            },
-            false
-          );
+          if (!liveLocationRef.current) return;
+          const resolvedPlace = {
+            ...data.place,
+            latitude: currentCoords.latitude,
+            longitude: currentCoords.longitude,
+            liveLocation: true,
+          };
+          setPlace(resolvedPlace);
+          localStorage.setItem("atmosLastPlace", JSON.stringify(resolvedPlace));
         } catch {
-          await loadWeather(
-            {
-              name: "Your current location",
-              country: "",
-              latitude: currentCoords.latitude,
-              longitude: currentCoords.longitude,
-              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-              liveLocation: true,
-            },
-            false
-          );
+          // Forecast already renders using coordinates if reverse geocoding is slow or unavailable.
         }
       },
       () => {

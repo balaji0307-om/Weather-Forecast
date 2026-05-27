@@ -1,6 +1,7 @@
 from typing import Any
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+import asyncio
 import copy
 import logging
 import os
@@ -16,8 +17,17 @@ from fastapi.responses import JSONResponse
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_client
     init_database()
-    yield
+    http_client = httpx.AsyncClient(
+        headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"},
+        timeout=httpx.Timeout(10, connect=5),
+    )
+    try:
+        yield
+    finally:
+        await http_client.aclose()
+        http_client = None
 
 
 app = FastAPI(title="Atmos Weather API", version="1.0.0", lifespan=lifespan)
@@ -40,6 +50,7 @@ DATABASE_PATH = os.getenv(
 
 response_cache: dict[str, tuple[float, Any]] = {}
 rate_limit_hits: dict[str, deque[float]] = defaultdict(deque)
+http_client: httpx.AsyncClient | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -111,10 +122,13 @@ async def fetch_json(base_url: str, params: dict[str, Any], timeout: int = 15) -
         return copy.deepcopy(cached[1])
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"}) as client:
-            response = await client.get(base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
+        if http_client is not None:
+            response = await http_client.get(base_url, params=params, timeout=timeout)
+        else:
+            async with httpx.AsyncClient(headers={"User-Agent": "Atmos-Weather-Dashboard/1.0"}) as client:
+                response = await client.get(base_url, params=params, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
         response_cache[key] = (time.time() + CACHE_TTL_SECONDS, data)
         return copy.deepcopy(data)
     except httpx.HTTPError as exc:
@@ -670,5 +684,20 @@ async def weather(
             ),
         },
     )
-    forecast = await apply_observed_current(forecast, latitude, longitude)
-    return await apply_air_quality(forecast, latitude, longitude, timezone)
+    forecast["current"]["temperature_source"] = "forecast grid"
+    forecast["air_quality"] = None
+    return forecast
+
+
+@app.get("/api/weather/details")
+async def weather_details(
+    latitude: float = Query(..., ge=-90, le=90),
+    longitude: float = Query(..., ge=-180, le=180),
+    timezone: str = Query("auto"),
+) -> dict[str, Any]:
+    details: dict[str, Any] = {"current": {}, "air_quality": None}
+    await asyncio.gather(
+        apply_observed_current(details, latitude, longitude),
+        apply_air_quality(details, latitude, longitude, timezone),
+    )
+    return details
