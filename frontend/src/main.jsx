@@ -338,6 +338,7 @@ function App() {
     if (text.length < 2) {
       setSuggestions([]);
       setSuggestionsOpen(false);
+      setSuggesting(false);
       return undefined;
     }
 
@@ -478,6 +479,11 @@ function App() {
   }
 
   function handleSearchKeyDown(event) {
+    if (event.key === "Enter" && suggestionsOpen && suggestions.length) {
+      event.preventDefault();
+      selectSuggestion(suggestions[activeSuggestion] || suggestions[0]);
+      return;
+    }
     if (!suggestionsOpen || !suggestions.length) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -588,7 +594,18 @@ function App() {
               <Search size={20} />
               <input
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                onChange={(event) => {
+                  const nextQuery = event.target.value;
+                  setQuery(nextQuery);
+                  setSuggestions([]);
+                  setActiveSuggestion(0);
+                  if (nextQuery.trim().length >= 2) {
+                    setSuggesting(true);
+                    setSuggestionsOpen(true);
+                  } else {
+                    setSuggestionsOpen(false);
+                  }
+                }}
                 onFocus={() => {
                   prepareNearbySearch();
                   if (query.trim().length >= 2) setSuggestionsOpen(true);
